@@ -80,7 +80,7 @@ class LoraAprsKissTnc(SX126x): #Inheritance of SX126x class
         # Configure LoRa to use TCXO with DIO3 as control
         if config.tcxo==True:
             self.setDio3TcxoCtrl(self.DIO3_OUTPUT_1_8, self.TCXO_DELAY_10)
-            
+
         #Configure DIO2 as RF Switch if rxen and txen are not used
         if (config.rxenPin==-1 and config.txenPin==-1):
             self.setDio2RfSwitch(True)
@@ -106,7 +106,7 @@ class LoraAprsKissTnc(SX126x): #Inheritance of SX126x class
         elif config.ldro != False or config.ldro != True: # if wrong values
             ldro = True #assign default value
         else:
-            ldro = config.ldro #manual assignment from config.py                                                                            
+            ldro = config.ldro #manual assignment from config.py
         # Configure modulation parameter including spreading factor (SF), bandwidth (BW), and coding rate (CR)
         # Receiver must have same SF and BW setting with transmitter to be able to receive LoRa packet
         self.setLoRaModulation(sf, bw, cr, ldro)
@@ -125,12 +125,14 @@ class LoraAprsKissTnc(SX126x): #Inheritance of SX126x class
         # This function will set PA config with optimal setting for requested TX power
         self.setTxPower(outputPower, self.TX_POWER_SX1268)
 
+        # Define callback for RX and start RX Continuous mode
         self.onReceive(self.callback) #callback function called after rx interrupt activation
         self.request(self.RX_CONTINUOUS) #Set receiver in continuous rx mode
-     
+
     #Frequency offset register is not documented on Semtech datasheets.
     #This function is inspred from Radiolib (https://github.com/jgromes/RadioLib/blob/master/src/modules/SX126x.cpp)
-    def getFreqError(self)  :
+
+    def getFreqError(self):
         state = self.readRegister(0x076B, 3)
         efe = (state[0]<<16 | state[1]<<8 | state[2]) & 0x0FFFFF
         #check the first bit
@@ -140,7 +142,6 @@ class LoraAprsKissTnc(SX126x): #Inheritance of SX126x class
         return error
 
     def callback(self) :
-
       payload = [] #put received data into list of integers
       while self.available() >= 1 :
           payload.append(self.read())
@@ -168,10 +169,12 @@ class LoraAprsKissTnc(SX126x): #Inheritance of SX126x class
       if self.server:
             self.server.send(payload,signalreport)
 
+      FUC_syslog.send(payload,rssi,snr,freq_err)
+
     def startListening(self):
         try:
             while True:
-                # only transmit if no signal is detected to avoid collisions
+                # check SPI is not busy
                 if not self.busyCheck(1):
                     if not self.queue.empty():
                         try:
@@ -181,11 +184,11 @@ class LoraAprsKissTnc(SX126x): #Inheritance of SX126x class
                                    # remove third party thing in case of OE_Style tx
                                    data = data[data.find(self.DATA_TYPE_THIRD_PARTY) + 1:]
                                data = self.LORA_APRS_HEADER + data
-                               logf("\033[94mLoRa TX OE Syle packet: \033[0m" + repr(data))
+                               logf("\033[94mPreparing LoRa TX OE Syle packet: \033[0m" + repr(data))
                                if config.disp_en:
                                   lcd("LoRa TX OE Syle packet: " + repr(data))
                             else:
-                                logf("\033[95mLoRa TX Standard AX25 packet: \033[0m" + repr(data))
+                                logf("\033[95mPreparing LoRa TX Standard AX25 packet: \033[0m" + repr(data))
                                 if config.disp_en:
                                   lcd("LoRa TX Standard AX25 packet: " + repr(data))
                             self.transmit(data)
@@ -198,15 +201,48 @@ class LoraAprsKissTnc(SX126x): #Inheritance of SX126x class
               lcd("Keyboard Interrupt received. Exiting...")
 
     def transmit(self, data):
-
         messageList = list(data)
         for i in range(len(messageList)) : messageList[i] = int(messageList[i])
-        # write() method must be placed between beginPacket() and endPacket()
-        self.beginPacket()
-        self.write(messageList, len(messageList))
-        self.endPacket()
-        self.wait() # Wait until modulation process for transmitting packet finish
-        self.request(self.RX_CONTINUOUS) #Request for receiving new LoRa packet in RX continuous mode
+        self.setStandby(self.STANDBY_XOSC) #we must start from st-by before cad scan
+        # Set Cad Parameters
+        # Values from Semtech Application Note AN1200.48, optimized for BW=125
+        if (config.spreadingFactor==7 or config.spreadingFactor==8):
+            symbols=self.CAD_ON_2_SYMB
+        else:
+            symbols=self.CAD_ON_4_SYMB
+        self.setCadParams(symbols, config.spreadingFactor+15, 10, self.CAD_EXIT_STDBY, 0) #return in stand-by after scan.
+        self.setDioIrqParams(self.IRQ_CAD_DONE | self.IRQ_CAD_DETECTED, self.IRQ_NONE, self.IRQ_NONE, self.IRQ_NONE) #activate cad_done and cad_detected IRQs
+        tx_done=False
+        cad_done=0
+        cad_det=0
+        retries=0
+        maxretries=3
+        while (not tx_done and retries <=maxretries):
+            self.clearIrqStatus(0x03FF) #clear register
+            self.setCad() #start scan
+            while cad_done == 0: #wait for scan end
+                time.sleep(0.50)
+                cad_done = (self.getIrqStatus() & self.IRQ_CAD_DONE) >> 7 #read cad_done bit
+            cad_det = (self.getIrqStatus() & self.IRQ_CAD_DETECTED) >> 8 #read cad_detected bit only after scan end
+            if cad_det == 0:
+                self.beginPacket()
+                self.write(messageList, len(messageList)) # write() method must be placed between beginPacket() and endPacket()
+                self.endPacket()
+                self.wait() # Wait until modulation process for transmitting packet finish
+                self.request(self.RX_CONTINUOUS) #go back in RX continuous mode after tx
+                logf("channel free, TX done")
+                tx_done=True
+                self.request(self.RX_CONTINUOUS)
+            else:
+                if retries==maxretries:
+                   logf("max limit of %i retries reached. Aborting tx of packet..." %maxretries)
+                   self.request(self.RX_CONTINUOUS)
+                   retries+=1
+                else:
+                   logf("Retry %i of %i. Channel busy, next try after 0,5s..." %(retries+1,maxretries))
+                   time.sleep(0.50)
+                   retries+=1
+
 
     def aprs_data_type(self, lora_aprs_frame):
         delimiter_position = lora_aprs_frame.find(b":")
